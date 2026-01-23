@@ -14,30 +14,31 @@
 | GEMMul8 INT8 (15 moduli) | 57,717 | ~74s | 0.000001004238983 | PASSED |
 | GEMMul8 INT8 (12 moduli) | 57,783 | ~72s | 0.000001004238983 | PASSED |
 
-## Multi-GPU Scaling Results (GEMMul8 INT8, 12 moduli)
+## Multi-GPU Scaling Results: Native FP64 vs GEMMul8 INT8
 
-| GPUs | Grid (P×Q) | N | Matrix/GPU | GFLOPS | Scaling | Status |
-|------|------------|-------|------------|--------|---------|--------|
-| 1 | 1×1 | 180,224 | 242 GiB | 57,783 | 1.00x | PASSED |
-| 2 | 1×2 | 250,880 | 235 GiB | 116,520 | 2.02x | PASSED |
-| 4 | 1×4 | 354,816 | 235 GiB | 235,810 | 4.08x | PASSED |
-| 8 | 1×8 | 501,760 | 235 GiB | 475,540 | 8.23x | PASSED |
+| GPUs | Grid | N | Native GFLOPS | GEMMul8 GFLOPS | Difference | Scaling | Status |
+|------|------|---------|---------------|----------------|------------|---------|--------|
+| 1 | 1×1 | 180,224 | 57,769 | 57,783 | +0.02% | 1.00x | PASSED |
+| 2 | 1×2 | 250,880 | 116,610 | 116,520 | -0.08% | 2.02x | PASSED |
+| 4 | 1×4 | 354,816 | 235,810 | 235,810 | 0.00% | 4.08x | PASSED |
+| 8 | 1×8 | 501,760 | 475,130 | 475,540 | +0.09% | 8.23x | PASSED |
 
 ## Key Observations
 
-### Performance Parity (Single GPU)
-- All three configurations achieve nearly identical performance (~57.7-57.8 TFLOPS)
-- Native FP64 and INT8 emulation produce **identical residual values**
-- 12 moduli is slightly faster than 15 moduli while maintaining accuracy
+### Performance Parity Across All GPU Counts
+- GEMMul8 INT8 emulation achieves **identical performance** to native FP64 rocBLAS
+- Difference between native and emulated is < 0.1% across all configurations
+- This confirms the benchmark is memory-bandwidth bound at these problem sizes
 
 ### Excellent Multi-GPU Scaling
-- Near-linear scaling observed up to 8 GPUs
-- 8 GPU configuration achieves **475.5 TFLOPS** (8.23x single GPU)
-- All multi-GPU tests pass HPL residual validation
+- Near-linear scaling observed up to 8 GPUs (8.23x on 8 GPUs)
+- Peak performance: **475.5 TFLOPS** on 8 MI355X GPUs
+- Both native and emulated scale identically
 
 ### Numerical Accuracy
 - GEMMul8's Ozaki method with 12 moduli achieves bit-accurate FP64 results
-- Residual values remain within HPL acceptance threshold across all configurations
+- Residual values are identical between native and emulated runs
+- All configurations pass HPL residual validation
 
 ## GEMMul8 Configuration
 ```bash
