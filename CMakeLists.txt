@@ -29,8 +29,10 @@ option(HPL_VERBOSE_PRINT   "Enable printing to terminal during run" OFF)
 option(HPL_PROGRESS_REPORT "Enable printing progess report to terminal during run" OFF)
 option(HPL_DETAILED_TIMING "Enable detailed timers during run" OFF)
 option(HPL_TRACING         "Annotate profiler traces with rocTX markers" OFF)
+option(HPL_USE_GEMMUL8     "Enable GEMMul8 FP64 emulation using INT8 tensor cores" OFF)
 
 option(ROCM_PATH "Path to ROCm install" /opt/rocm)
+set(GEMMUL8_DIR "" CACHE PATH "Path to GEMMul8 installation")
 option(HPL_MPI_DIR  "Path to MPI library" ${CMAKE_CURRENT_SOURCE_DIR}/tpl/openmpi)
 
 set(CMAKE_INSTALL_PREFIX "rocHPL" CACHE PATH "Install path prefix, prepended onto install directories")
@@ -137,6 +139,18 @@ if(HPL_TRACING)
   target_compile_definitions(rochpl PRIVATE HPL_TRACING)
 endif()
 
+if(HPL_USE_GEMMUL8)
+  target_compile_definitions(rochpl PRIVATE HPL_USE_GEMMUL8)
+  if(GEMMUL8_DIR)
+    target_include_directories(rochpl PRIVATE ${GEMMUL8_DIR}/include ${GEMMUL8_DIR}/src)
+    # Link with shared library to avoid PIE issues
+    target_link_directories(rochpl PRIVATE ${GEMMUL8_DIR}/lib)
+    target_link_libraries(rochpl PRIVATE gemmul8)
+  else()
+    message(FATAL_ERROR "GEMMUL8_DIR must be set when HPL_USE_GEMMUL8 is enabled")
+  endif()
+endif()
+
 # Target include directories
 target_include_directories(rochpl
                            PRIVATE
@@ -157,6 +171,7 @@ target_link_libraries(rochpl PRIVATE OpenMP::OpenMP_CXX)
 
 # Target link libraries
 target_link_libraries(rochpl PRIVATE roc::rocblas)
+target_link_libraries(rochpl PRIVATE roc::hipblas)
 
 if(HPL_TRACING)
   target_link_libraries(rochpl PRIVATE roc::roctracer)

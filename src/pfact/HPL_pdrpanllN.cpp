@@ -132,9 +132,9 @@ void HPL_pdrpanllN(HPL_T_panel* PANEL,
                                       Mptr(L1ptr, 0, jj, n0),
                                       n0));
 
-    CHECK_ROCBLAS_ERROR(rocblas_dgemm(handle,
-                                      rocblas_operation_none,
-                                      rocblas_operation_none,
+    CHECK_HIPBLAS_ERROR(HPL_DGEMM(hipblasHandle,
+                                      HIPBLAS_OP_N,
+                                      HIPBLAS_OP_N,
                                       m,
                                       jb,
                                       jj,

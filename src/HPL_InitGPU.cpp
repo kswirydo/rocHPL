@@ -11,7 +11,8 @@
 #include "hpl.hpp"
 #include <algorithm>
 
-rocblas_handle handle;
+rocblas_handle  handle;
+hipblasHandle_t hipblasHandle;
 
 hipStream_t computeStream, dataStream;
 
@@ -94,6 +95,38 @@ void HPL_InitGPU(const HPL_T_grid* GRID) {
 
   rocblas_initialize();
 
+  /* Create a hipBLAS handle (for DGEMM interception by GEMMul8) */
+  CHECK_HIPBLAS_ERROR(hipblasCreate(&hipblasHandle));
+  CHECK_HIPBLAS_ERROR(hipblasSetPointerMode(hipblasHandle, HIPBLAS_POINTER_MODE_HOST));
+  CHECK_HIPBLAS_ERROR(hipblasSetStream(hipblasHandle, computeStream));
+
+  /* Warmup hipblasGemmEx with INT8 to pre-initialize hipblaslt */
+  {
+    int8_t *warmupA = nullptr, *warmupB = nullptr;
+    int32_t *warmupC = nullptr;
+    CHECK_HIP_ERROR(hipMalloc(&warmupA, 16 * 16 * sizeof(int8_t)));
+    CHECK_HIP_ERROR(hipMalloc(&warmupB, 16 * 16 * sizeof(int8_t)));
+    CHECK_HIP_ERROR(hipMalloc(&warmupC, 16 * 16 * sizeof(int32_t)));
+    CHECK_HIP_ERROR(hipMemset(warmupA, 0, 16 * 16 * sizeof(int8_t)));
+    CHECK_HIP_ERROR(hipMemset(warmupB, 0, 16 * 16 * sizeof(int8_t)));
+    CHECK_HIP_ERROR(hipMemset(warmupC, 0, 16 * 16 * sizeof(int32_t)));
+    int32_t alpha = 1, beta = 0;
+    hipblasStatus_t gemmStatus = hipblasGemmEx(hipblasHandle, HIPBLAS_OP_N, HIPBLAS_OP_N,
+                  16, 16, 16, &alpha,
+                  warmupA, HIP_R_8I, 16,
+                  warmupB, HIP_R_8I, 16,
+                  &beta,
+                  warmupC, HIP_R_32I, 16,
+                  HIPBLAS_COMPUTE_32I, HIPBLAS_GEMM_DEFAULT);
+    if (gemmStatus != HIPBLAS_STATUS_SUCCESS) {
+      std::cerr << "hipblasGemmEx INT8 warmup failed with status " << gemmStatus << std::endl;
+    }
+    CHECK_HIP_ERROR(hipDeviceSynchronize());
+    CHECK_HIP_ERROR(hipFree(warmupA));
+    CHECK_HIP_ERROR(hipFree(warmupB));
+    CHECK_HIP_ERROR(hipFree(warmupC));
+  }
+
 #ifdef HPL_ROCBLAS_ALLOW_ATOMICS
   CHECK_ROCBLAS_ERROR(
       rocblas_set_atomics_mode(handle, rocblas_atomics_allowed));
@@ -104,6 +137,7 @@ void HPL_InitGPU(const HPL_T_grid* GRID) {
 }
 
 void HPL_FreeGPU() {
+  CHECK_HIPBLAS_ERROR(hipblasDestroy(hipblasHandle));
   CHECK_ROCBLAS_ERROR(rocblas_destroy_handle(handle));
 
   CHECK_HIP_ERROR(hipEventDestroy(swapStartEvent[HPL_LOOK_AHEAD]));

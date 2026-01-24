@@ -51,6 +51,10 @@ message("-- rocBLAS version:      ${rocblas_VERSION}")
 message("-- rocBLAS include dirs: ${rocblas_INCLUDE_DIRS}")
 message("-- rocBLAS libraries:    ${rocblas_LIBRARIES}")
 
+# hipblas (for GEMMul8 interception)
+find_package(hipblas REQUIRED)
+message("-- hipBLAS version:      ${hipblas_VERSION}")
+
 get_filename_component(ROCBLAS_LIB_PATH ${rocblas_LIBRARIES} DIRECTORY)
 
 if(HPL_TRACING)

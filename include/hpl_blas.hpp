@@ -23,11 +23,13 @@
 
 #include "hpl_misc.hpp"
 #include <rocblas/rocblas.h>
+#include <hipblas/hipblas.h>
 #include <iostream>
 
-extern rocblas_handle handle;
-extern hipStream_t    computeStream;
-extern hipStream_t    dataStream;
+extern rocblas_handle  handle;
+extern hipblasHandle_t hipblasHandle;
+extern hipStream_t     computeStream;
+extern hipStream_t     dataStream;
 
 #define CHECK_HIP_ERROR(val) hipCheck((val), #val, __FILE__, __LINE__)
 inline void hipCheck(hipError_t        err,
@@ -50,6 +52,19 @@ inline void rocBLASCheck(rocblas_status    err,
     std::cerr << "rocBLAS Reports Error at: " << file << ":" << line
               << std::endl;
     std::cerr << rocblas_status_to_string(err) << " " << func << std::endl;
+    std::exit(-1);
+  }
+}
+
+#define CHECK_HIPBLAS_ERROR(val) hipBLASCheck((val), #val, __FILE__, __LINE__)
+inline void hipBLASCheck(hipblasStatus_t   err,
+                         const char* const func,
+                         const char* const file,
+                         const int         line) {
+  if(err != HIPBLAS_STATUS_SUCCESS) {
+    std::cerr << "hipBLAS Reports Error at: " << file << ":" << line
+              << std::endl;
+    std::cerr << "hipblasStatus_t = " << err << " " << func << std::endl;
     std::exit(-1);
   }
 }

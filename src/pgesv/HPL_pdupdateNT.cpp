@@ -129,9 +129,9 @@ void HPL_pdupdateNT(HPL_T_panel* PANEL, const HPL_T_UPD UPD) {
    */
   if(curr != 0) {
     CHECK_HIP_ERROR(hipEventRecord(dgemmStart[UPD], stream));
-    CHECK_ROCBLAS_ERROR(rocblas_dgemm(handle,
-                                      rocblas_operation_none,
-                                      rocblas_operation_transpose,
+    CHECK_HIPBLAS_ERROR(HPL_DGEMM(hipblasHandle,
+                                      HIPBLAS_OP_N,
+                                      HIPBLAS_OP_T,
                                       mp,
                                       n,
                                       jb,
@@ -148,9 +148,9 @@ void HPL_pdupdateNT(HPL_T_panel* PANEL, const HPL_T_UPD UPD) {
     if(PANEL->grid->nprow > 1) HPL_dlatcpy(jb, n, Uptr, LDU, Aptr, lda);
   } else {
     CHECK_HIP_ERROR(hipEventRecord(dgemmStart[UPD], stream));
-    CHECK_ROCBLAS_ERROR(rocblas_dgemm(handle,
-                                      rocblas_operation_none,
-                                      rocblas_operation_transpose,
+    CHECK_HIPBLAS_ERROR(HPL_DGEMM(hipblasHandle,
+                                      HIPBLAS_OP_N,
+                                      HIPBLAS_OP_T,
                                       mp,
                                       n,
                                       jb,

@@ -120,9 +120,9 @@ void HPL_pdrpancrT(HPL_T_panel* PANEL,
     /*
      * Local update - Factor current panel - Replicated update and solve
      */
-    CHECK_ROCBLAS_ERROR(rocblas_dgemm(handle,
-                                      rocblas_operation_none,
-                                      rocblas_operation_transpose,
+    CHECK_HIPBLAS_ERROR(HPL_DGEMM(hipblasHandle,
+                                      HIPBLAS_OP_N,
+                                      HIPBLAS_OP_T,
                                       m,
                                       jb,
                                       jj,
@@ -137,9 +137,9 @@ void HPL_pdrpancrT(HPL_T_panel* PANEL,
 
     HPL_pdrpancrT(PANEL, m, jb, ioff);
 
-    CHECK_ROCBLAS_ERROR(rocblas_dgemm(handle,
-                                      rocblas_operation_none,
-                                      rocblas_operation_none,
+    CHECK_HIPBLAS_ERROR(HPL_DGEMM(hipblasHandle,
+                                      HIPBLAS_OP_N,
+                                      HIPBLAS_OP_N,
                                       n,
                                       jb,
                                       jj,
