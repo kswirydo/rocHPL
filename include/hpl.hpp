@@ -59,6 +59,7 @@ but will potentailly lead to residual values which vary from run-to-run
 #include "hpl_misc.hpp"
 #include "hpl_blas.hpp"
 #include "hpl_gemmul8.hpp"
+#include "hpl_ozaki.hpp"
 #include "hpl_auxil.hpp"
 
 #include "hpl_pmisc.hpp"
