@@ -1,0 +1,377 @@
+#!/usr/bin/env bash
+# Author: Noel Chalmers
+
+# set -x #echo on
+
+# #################################################
+# helper functions
+# #################################################
+function display_help()
+{
+  echo "rocHPL run helper script"
+  echo "./run_rochpl "
+  echo "    [-P]    Specific MPI grid size: the number of         "
+  echo "            rows in MPI grid.                             "
+  echo "    [-Q]    Specific MPI grid size: the number of         "
+  echo "            columns in MPI grid.                          "
+  echo "    [-p]    Specific node-local MPI grid size: the number "
+  echo "            of rows in node-local MPI grid. Must evenly   "
+  echo "            divide P.                                     "
+  echo "    [-q]    Specific node-local MPI grid size: the number "
+  echo "            of columns in node-local MPI grid. Must evenly"
+  echo "            divide Q.                                     "
+  echo "    [-N]    Specific matrix size: the number of           "
+  echo "            rows/columns in global matrix.                "
+  echo "    [--NB]  Specific panel size: the number of            "
+  echo "            rows/columns in panels.                       "
+  echo "    [--it]  Iterations: the number of times to run each   "
+  echo "            problem size.                                 "
+  echo "    [-f]    Specific split fraction: the percentange to   "
+  echo "            split the trailing submatrix.                 "
+  echo "    [-i]    Input file. When set, all other commnand      "
+  echo "            line parameters are ignored, and problem      "
+  echo "            parameters are read from input file.          "
+  echo "    [-h|--help] prints this help message                  "
+  echo "    [--version] Print rocHPL version number.              "
+}
+
+# This function is helpful for dockerfiles that do not have sudo installed, but the default user is root
+# true is a system command that completes successfully, function returns success
+# prereq: ${ID} must be defined before calling
+supported_distro( )
+{
+  if [ -z ${ID+foo} ]; then
+    printf "supported_distro(): \$ID must be set\n"
+    exit 2
+  fi
+
+  case "${ID}" in
+    debian|linuxmint|ubuntu|centos|rhel|fedora|sles|tencentos)
+        true
+        ;;
+    *)  printf "This script is currently supported on Debian, Linuxmint, Ubuntu, CentOS, RHEL, Fedora and SLES\n"
+        exit 2
+        ;;
+  esac
+}
+
+# #################################################
+# Pre-requisites check
+# #################################################
+# Exit code 0: alls well
+# Exit code 1: problems with getopt
+# Exit code 2: problems with supported platforms
+
+# check if getopt command is installed
+type getopt > /dev/null
+if [[ $? -ne 0 ]]; then
+  echo "This script uses getopt to parse arguments; try installing the util-linux package";
+  exit 1
+fi
+
+# os-release file describes the system
+if [[ -e "/etc/os-release" ]]; then
+  source /etc/os-release
+else
+  echo "This script depends on the /etc/os-release file"
+  exit 2
+fi
+
+# The following function exits script if an unsupported distro is detected
+supported_distro
+
+# #################################################
+# global variables
+# #################################################
+# Grab options from CMake config
+rochpl_bin=/home/kswirydo/rocHPL/build/rocHPL/bin/rochpl
+rocm_dir=/opt/rocm
+rocblas_dir=/opt/rocm-7.2.1/lib
+blas_dir=
+
+P=1
+Q=1
+p=-1
+q=-1
+N=45312
+NB=384
+it=1
+frac=0.3
+
+filename=HPL.dat
+inputfile=false
+cmdrun=false
+
+devices=
+
+export LD_LIBRARY_PATH=${rocblas_dir}:${blas_dir}:${rocm_dir}/lib:$LD_LIBRARY_PATH
+
+# #################################################
+# Parameter parsing
+# #################################################
+
+# check if we have a modern version of getopt that can handle whitespace and long parameters
+getopt -T
+if [[ $? -eq 4 ]]; then
+  GETOPT_PARSE=$(getopt --name "${0}" --longoptions NB:,it:,help,version,devices:, --options hP:Q:p:q:N:i:f: -- "$@")
+else
+  echo "Need a new version of getopt"
+  exit 1
+fi
+
+if [[ $? -ne 0 ]]; then
+  echo "getopt invocation failed; could not parse the command line";
+  exit 1
+fi
+
+eval set -- "${GETOPT_PARSE}"
+
+while true; do
+  case "${1}" in
+    -h|--help)
+        display_help
+        exit 0
+        ;;
+    --version)
+        ${rochpl_bin} --version
+        exit 0
+        ;;
+    -P)
+        P=${2}
+        shift 2 ;;
+    -Q)
+        Q=${2}
+        shift 2 ;;
+    -p)
+        p=${2}
+        shift 2 ;;
+    -q)
+        q=${2}
+        shift 2 ;;
+    -N)
+        N=${2}
+        cmdrun=true
+        shift 2 ;;
+    --NB)
+        NB=${2}
+        cmdrun=true
+        shift 2 ;;
+    --it)
+        it=${2}
+        shift 2 ;;
+    -f)
+        frac=${2}
+        shift 2 ;;
+    -i)
+        filename=${2}
+        inputfile=true
+        shift 2 ;;
+    --devices)
+        devices=${2}
+        shift 2 ;;
+    --) shift ; break ;;
+    *)  echo "Unexpected command line parameter received; aborting";
+        exit 1
+        ;;
+  esac
+done
+
+#if nothing but np and ppn parameters where given, default to running
+# with default input file
+if [[ "${inputfile}" == false && "${cmdrun}" == false ]]; then
+  inputfile=true
+fi
+
+np=$(($P*$Q))
+if [[ "$np" -lt 1 ]]; then
+  echo "Invalid MPI grid parameters; aborting";
+  exit 1
+fi
+
+#######################################
+# Now figure out the CPU core mappings
+#######################################
+
+# Get local process numbering
+set +u
+if [[ -n ${OMPI_COMM_WORLD_LOCAL_RANK+x} ]]; then
+  globalRank=$OMPI_COMM_WORLD_RANK
+  globalSize=$OMPI_COMM_WORLD_SIZE
+  rank=$OMPI_COMM_WORLD_LOCAL_RANK
+  size=$OMPI_COMM_WORLD_LOCAL_SIZE
+elif [[ -n ${SLURM_LOCALID+x} ]]; then
+  globalRank=$SLURM_PROCID
+  globalSize=$SLURM_NTASKS
+  rank=$SLURM_LOCALID
+  size=$SLURM_TASKS_PER_NODE
+  #Slurm can return a string like "2(x2),1". Get the first number
+  size=$(echo $size | sed -r 's/^([^.]+).*$/\1/; s/^[^0-9]*([0-9]+).*$/\1/')
+elif [[ -n ${FLUX_TASK_LOCAL_ID+x} ]]; then
+  globalRank=$FLUX_TASK_RANK
+  globalSize=$FLUX_JOB_SIZE
+  nnodes=$FLUX_JOB_NNODES
+  rank=$FLUX_TASK_LOCAL_ID
+  size=$((globalSize/nnodes))
+fi
+set -u
+
+#Determing node-local grid size
+if [[ "$p" -lt 1 && "$q" -lt 1 ]]; then
+  # no node-local grid was specified, pick defaults
+  q=$(( (Q<=size) ? Q : size))
+
+  if [[ $((size % q)) -gt 0 ]]; then
+    echo "Invalid MPI grid parameters; Unable to form node-local grid; aborting";
+    exit 1
+  fi
+
+  p=$(( size/q ))
+
+elif [[ "$p" -lt 1 ]]; then
+  #q was specified
+
+  if [[ $((size % q)) -gt 0 ]]; then
+    echo "Invalid MPI grid parameters; Unable to form node-local grid; aborting";
+    exit 1
+  fi
+
+  p=$(( size/q ))
+
+elif [[ "$q" -lt 1 ]]; then
+  #p was specified
+
+  if [[ $((size % p)) -gt 0 ]]; then
+    echo "Invalid MPI grid parameters; Unable to form node-local grid; aborting";
+    exit 1
+  fi
+
+  q=$(( size/p ))
+
+else
+  #Both p and q were specified
+  if [[ $size -ne $((p*q)) ]]; then
+    echo "Invalid MPI grid parameters; Unable to form node-local grid; aborting";
+    exit 1
+  fi
+fi
+
+# Check that the columns are evenly divided among nodes
+if [[ $((P % p)) -gt 0 ]]; then
+  echo "Invalid MPI grid parameters; Must have the same number of P rows on every node; aborting";
+  exit 1
+fi
+
+# Check that the rows are evenly divided among nodes
+if [[ $((Q % q)) -gt 0 ]]; then
+  echo "Invalid MPI grid parameters; Must have the same number of Q columns on every node; aborting";
+  exit 1
+fi
+
+myp=$((rank%p))
+myq=$((rank/p))
+
+#construct a list of all cpus, sorted by core
+cpulist=$(lscpu --parse=CPU,CORE,NODE | awk '!/#/' | tr ',' "\t" | sort -k 2 -g -s)
+
+#construct list of devices and their numa affinities
+devicelist=$(${rocm_dir}/bin/rocm-smi --csv --showtoponuma | tail -n +2 | tr ',' "\t")
+
+#count the cpus per core
+threads_per_core=$(echo "${cpulist}" | grep -c ".*	0	.*")
+
+#remove the extra cpus on each core to make a list of just physical cores, then sort by numa domain
+corelist=$(echo "$cpulist" | awk -v tpc=${threads_per_core} '(NR-1)%tpc==0' | sort -k 3 -g -s)
+
+#count numa domains
+line=($(echo "$cpulist" | tail -n 1))
+n_numa=$((line[2]+1))
+
+numa_core_counts=()
+numa_proc_counts=()
+for i in $(seq 1 ${n_numa}); do numa_core_counts+=(0); numa_proc_counts+=(0); done
+
+#parse the list of cpus to array and count cpus in each numa
+cpus=()
+while read -a line; do
+  cpus+=(${line[0]})
+  ((numa_core_counts[${line[2]}]++))
+done <<< ${corelist}
+
+numa_core_offsets=(0)
+for i in $(seq 1 $((n_numa-1))); do numa_core_offsets+=($((numa_core_offsets[$((i-1))] + numa_core_counts[$i]))); done
+
+#parse device to numa mapping
+device_to_numa=()
+while read -a line; do
+  device_to_numa+=(${line[1]})
+done <<< ${devicelist}
+
+rank_to_device=()
+
+if [ ! -z "${devices}" ]; then
+	IFS=',' read -r -a device_array <<< "$devices"
+	n_devices=${#device_array[@]}
+  for i in $(seq 0 $((size-1))); do
+    rank_to_device+=(${device_array[$((i%n_devices))]})
+  done
+
+  export ROCR_VISIBLE_DEVICES=${rank_to_device[rank]}
+else
+	n_devices=$(echo "${devicelist}" | grep -c "card")
+  for i in $(seq 0 $((size-1))); do
+    rank_to_device+=($((i%n_devices)))
+  done
+fi
+mygpu=${rank_to_device[rank]}
+mynuma=${device_to_numa[mygpu]}
+
+rank_to_numa=()
+for i in $(seq 0 $((size-1))); do
+  rank_to_numa+=(${device_to_numa[${rank_to_device[$((i%n_devices))]}]})
+done
+
+for i in $(seq 0 $((size-1))); do
+  numa=${rank_to_numa[$i]}
+  ((numa_proc_counts[numa]++))
+done
+
+omp_num_threads=$((numa_core_counts[mynuma]/numa_proc_counts[mynuma]))
+
+core_offset=${numa_core_offsets[mynuma]}
+for i in $(seq 0 $((rank-1))); do
+  numa=${rank_to_numa[$i]}
+  if [[ $numa -eq $mynuma ]]; then
+    core_offset=$((core_offset + omp_num_threads))
+  fi
+done
+
+omp_places="{${cpus[core_offset]}}"
+for c in $(seq 1 $((omp_num_threads-1))); do
+  omp_places+=",{${cpus[core_offset+c]}}"
+done
+
+if [[ $omp_num_threads -gt 1 ]]; then
+  places="{${cpus[core_offset]}-${cpus[core_offset+$((omp_num_threads-1))]}}"
+else
+  places="{${cpus[core_offset]}}"
+fi
+
+# Export OpenMP config
+export OMP_NUM_THREADS=${omp_num_threads}
+export OMP_PLACES=${omp_places}
+export OMP_PROC_BIND=true
+
+
+if [[ $globalRank -lt $size ]]; then
+  echo "Node Binding: Process $rank [(p,q)=($myp,$myq)] GPU: $mygpu, CPU Cores: $omp_num_threads - $places"
+fi
+
+rochpl_args="-P ${P} -Q ${Q} -p ${p} -q ${q} -f ${frac} -it ${it}"
+if [[ "${inputfile}" == true ]]; then
+  rochpl_args+=" -i ${filename}"
+else
+  rochpl_args+=" -N ${N} -NB ${NB}"
+fi
+
+#run
+${rochpl_bin} ${rochpl_args}

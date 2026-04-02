@@ -65,9 +65,21 @@ echo ""
 
 ROCHPL_BIN="/home/kswirydo/rocHPL/build/bin/rochpl"
 ROCM_DIR="/opt/rocm"
+ROCHPL_WORKDIR="/home/kswirydo/rocHPL/build/rocHPL_gemmul8"
 
 # Set library paths
 export LD_LIBRARY_PATH="${ROCM_DIR}/lib:${LD_LIBRARY_PATH}"
+
+# Change to working directory with HPL.dat
+if [ ! -f "$ROCHPL_WORKDIR/HPL.dat" ]; then
+    echo "ERROR: HPL.dat not found at $ROCHPL_WORKDIR/HPL.dat"
+    echo "Please create an HPL.dat configuration file in that directory."
+    exit 1
+fi
+
+cd "$ROCHPL_WORKDIR"
+echo "Working directory: $(pwd)"
+echo ""
 
 # Run with LD_PRELOAD for GEMMul8
 exec env LD_PRELOAD="$GEMMUL8_LIB" "$ROCHPL_BIN" "$@"

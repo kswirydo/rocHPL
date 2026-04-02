@@ -8,6 +8,7 @@
 #include <rocblas/rocblas.h>
 #include <unordered_map>
 #include <mutex>
+#include <atomic>
 #include <cstdlib>
 #include <cstdio>
 #include <memory>
@@ -189,6 +190,27 @@ int get_num_slices() {
     return num_slices;
 }
 
+struct OzakiStats {
+    std::atomic<int> ozaki_gemm_count{0};
+    std::atomic<int> dgeam_count{0};
+    std::atomic<int> fallback_dgemm_count{0};
+    std::atomic<int> copy_A_count{0};
+    std::atomic<int> copy_B_count{0};
+    
+    ~OzakiStats() {
+        if (ozaki_gemm_count > 0 || fallback_dgemm_count > 0) {
+            fprintf(stderr, "\n[OZAKI STATS] Ozaki GEMMs: %d, dgeam (transpose B): %d, fallback dgemm: %d, copy A: %d, copy B: %d\n",
+                    ozaki_gemm_count.load(), dgeam_count.load(), fallback_dgemm_count.load(),
+                    copy_A_count.load(), copy_B_count.load());
+        }
+    }
+};
+
+OzakiStats& get_stats() {
+    static OzakiStats stats;
+    return stats;
+}
+
 __global__ void fused_scale_add_kernel(
     double* __restrict__ C, int ldc,
     const double* __restrict__ temp, int ld_temp,
@@ -262,6 +284,23 @@ extern "C" hipblasStatus_t hpl_ozaki_dgemm(
     
     // For now, only handle OP_N for A (most common in HPL)
     if (transA) {
+        get_stats().fallback_dgemm_count++;
+        return call_real_dgemm(hipHandle, transa, transb, m, n, k,
+                              alpha, A, lda, B, ldb, beta, C, ldc);
+    }
+    
+    // Fall back to native DGEMM for very large GEMMs to avoid workspace OOM
+    // Scheme I workspace scales as O(M*N*slices) which can be huge
+    size_t workspace_estimate = (size_t)m * n * num_slices * sizeof(int32_t);
+    const size_t MAX_WORKSPACE = 8ULL * 1024 * 1024 * 1024;  // 8 GB limit
+    if (workspace_estimate > MAX_WORKSPACE) {
+        static bool logged = false;
+        if (!logged) {
+            fprintf(stderr, "[OZAKI] GEMM too large (m=%d, n=%d, estimated workspace=%.1f GB), using native DGEMM\n",
+                    m, n, workspace_estimate / 1e9);
+            logged = true;
+        }
+        get_stats().fallback_dgemm_count++;
         return call_real_dgemm(hipHandle, transa, transb, m, n, k,
                               alpha, A, lda, B, ldb, beta, C, ldc);
     }
@@ -273,11 +312,16 @@ extern "C" hipblasStatus_t hpl_ozaki_dgemm(
     OzakiContext* ctx = get_context();
     
     static int ozaki_call_count = 0;
+    static int transB_T_count = 0;
+    static int transB_N_count = 0;
     ozaki_call_count++;
-    if (ozaki_call_count <= 5) {
-        fprintf(stderr, "[OZAKI] Call #%d: m=%d, n=%d, k=%d, slices=%d, transA=%d, transB=%d, alpha=%.2f, beta=%.2f, lda=%d, ldb=%d, ldc=%d\n", 
-                ozaki_call_count, m, n, k, num_slices, transA, transB, h_alpha, h_beta, lda, ldb, ldc);
+    if (transB) transB_T_count++; else transB_N_count++;
+    
+    if (ozaki_call_count <= 5 || ozaki_call_count % 20 == 0) {
+        fprintf(stderr, "[OZAKI #%d] m=%d n=%d k=%d transB=%d | Running totals: OP_T=%d, OP_N=%d\n", 
+                ozaki_call_count, m, n, k, transB, transB_T_count, transB_N_count);
     }
+    
     
     try {
         hipGetLastError();
@@ -308,6 +352,7 @@ extern "C" hipblasStatus_t hpl_ozaki_dgemm(
             hipLaunchKernelGGL(copy_matrix_kernel, grid, block, 0, stream,
                                temp_A, M, A, lda, M, K);
             A_ozaki = temp_A;
+            get_stats().copy_A_count++;
         }
         
         // Handle B based on transpose
@@ -342,10 +387,12 @@ extern "C" hipblasStatus_t hpl_ozaki_dgemm(
                 temp_B, K
             );
             if (st != rocblas_status_success) {
+                get_stats().fallback_dgemm_count++;
                 return call_real_dgemm(hipHandle, transa, transb, m, n, k,
                                       alpha, A, lda, B, ldb, beta, C, ldc);
             }
             B_ozaki = temp_B;
+            get_stats().dgeam_count++;
         } else {
             // B is K x N (column-major), use directly if contiguous
             B_rows_ozaki = K;
@@ -364,6 +411,7 @@ extern "C" hipblasStatus_t hpl_ozaki_dgemm(
                 hipLaunchKernelGGL(copy_matrix_kernel, grid, block, 0, stream,
                                    temp_B, K, B, ldb, K, N);
                 B_ozaki = temp_B;
+                get_stats().copy_B_count++;
             }
         }
         
@@ -378,6 +426,7 @@ extern "C" hipblasStatus_t hpl_ozaki_dgemm(
         // ozablas computes: temp_C = A_ozaki * B_ozaki
         // A_ozaki is M x K, B_ozaki is K x N, temp_C is M x N (all contiguous column-major)
         ozablas::ozaki_scheme1_gemm(*ws, A_ozaki, B_ozaki, temp_C);
+        get_stats().ozaki_gemm_count++;
         
         ctx->executor->synchronize();
         

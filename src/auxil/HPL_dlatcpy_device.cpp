@@ -16,6 +16,7 @@
 
 #include "hpl.hpp"
 #include <hip/hip_runtime.h>
+#include <cstdio>
 
 #define TILE_DIM 64
 #define BLOCK_ROWS 16
@@ -109,6 +110,20 @@ void HPL_dlatcpy(const int     M,
 
   dim3 grid_size((M + TILE_DIM - 1) / TILE_DIM, (N + TILE_DIM - 1) / TILE_DIM);
   dim3 block_size(TILE_DIM, BLOCK_ROWS);
+  
+  // Clear any pending errors before launch
+  hipError_t pre_err = hipGetLastError();
+  if (pre_err != hipSuccess) {
+    fprintf(stderr, "[HPL_dlatcpy] WARNING: Pending HIP error before launch: %s\n", hipGetErrorString(pre_err));
+    fflush(stderr);
+  }
+  
   dlatcpy<<<grid_size, block_size, 0, stream>>>(M, N, A, LDA, B, LDB);
-  CHECK_HIP_ERROR(hipGetLastError());
+  hipError_t launch_err = hipGetLastError();
+  if (launch_err != hipSuccess) {
+    fprintf(stderr, "[HPL_dlatcpy] Kernel launch FAILED: M=%d, N=%d, LDA=%d, LDB=%d, grid=(%u,%u), block=(%u,%u), stream=%p, error=%s\n",
+            M, N, LDA, LDB, grid_size.x, grid_size.y, block_size.x, block_size.y, (void*)stream, hipGetErrorString(launch_err));
+    fflush(stderr);
+  }
+  CHECK_HIP_ERROR(launch_err);
 }

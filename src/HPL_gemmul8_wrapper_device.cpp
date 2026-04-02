@@ -184,6 +184,14 @@ extern "C" hipblasStatus_t hpl_gemmul8_dgemm(
         handle_set = true;
     }
     
+    // Debug: confirm GEMMul8 is being called
+    static int gemmul8_call_count = 0;
+    gemmul8_call_count++;
+    if (gemmul8_call_count <= 3) {
+        fprintf(stderr, "[GEMMUL8 ACTIVE] Call #%d: m=%d, n=%d, k=%d, moduli=%d\n", 
+                gemmul8_call_count, m, n, k, num_moduli);
+    }
+    
     // Call gemmul8
     gemmul8::gemm<double, true>(
         handle,
@@ -202,11 +210,7 @@ extern "C" hipblasStatus_t hpl_gemmul8_dgemm(
         false, false
     );
     
-    // Ensure all operations complete on the stream
-    hipStream_t stream;
-    hipblasGetStream(handle, &stream);
-    hipStreamSynchronize(stream);
-    
+    // Note: No stream sync here - rocHPL manages synchronization
     return HIPBLAS_STATUS_SUCCESS;
 }
 
