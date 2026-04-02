@@ -1,5 +1,5 @@
 /*
- * OzaBLAS Scheme I wrapper for rocHPL
+ * OzaBLAS Scheme I wrapper for rocHPL (column-major version)
  * This file must be compiled with hipcc to access ozablas
  */
 
@@ -82,8 +82,12 @@ namespace {
 struct OzakiContext {
     std::shared_ptr<ozablas::HipExecutor> executor;
     std::unordered_map<size_t, std::unique_ptr<ozablas::WorkspaceScheme1>> workspaces;
-    double* temp_buffer = nullptr;
-    size_t temp_buffer_size = 0;
+    double* temp_C = nullptr;
+    size_t temp_C_size = 0;
+    double* temp_B = nullptr;
+    size_t temp_B_size = 0;
+    double* temp_A = nullptr;
+    size_t temp_A_size = 0;
     std::mutex mtx;
     
     OzakiContext() {
@@ -93,9 +97,9 @@ struct OzakiContext {
     }
     
     ~OzakiContext() {
-        if (temp_buffer) {
-            hipFree(temp_buffer);
-        }
+        if (temp_C) hipFree(temp_C);
+        if (temp_B) hipFree(temp_B);
+        if (temp_A) hipFree(temp_A);
     }
     
     ozablas::WorkspaceScheme1* get_workspace(size_t M, size_t N, size_t K, size_t slices) {
@@ -111,21 +115,46 @@ struct OzakiContext {
         return workspaces[key].get();
     }
     
-    double* get_temp_buffer(size_t size) {
+    double* get_temp_C(size_t size) {
         std::lock_guard<std::mutex> lock(mtx);
-        if (temp_buffer_size < size) {
-            if (temp_buffer) {
-                hipFree(temp_buffer);
-            }
-            hipError_t err = hipMalloc(&temp_buffer, size);
-            if (err != hipSuccess) {
-                temp_buffer = nullptr;
-                temp_buffer_size = 0;
+        if (temp_C_size < size) {
+            if (temp_C) hipFree(temp_C);
+            if (hipMalloc(&temp_C, size) != hipSuccess) {
+                temp_C = nullptr;
+                temp_C_size = 0;
                 return nullptr;
             }
-            temp_buffer_size = size;
+            temp_C_size = size;
         }
-        return temp_buffer;
+        return temp_C;
+    }
+    
+    double* get_temp_B(size_t size) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (temp_B_size < size) {
+            if (temp_B) hipFree(temp_B);
+            if (hipMalloc(&temp_B, size) != hipSuccess) {
+                temp_B = nullptr;
+                temp_B_size = 0;
+                return nullptr;
+            }
+            temp_B_size = size;
+        }
+        return temp_B;
+    }
+    
+    double* get_temp_A(size_t size) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (temp_A_size < size) {
+            if (temp_A) hipFree(temp_A);
+            if (hipMalloc(&temp_A, size) != hipSuccess) {
+                temp_A = nullptr;
+                temp_A_size = 0;
+                return nullptr;
+            }
+            temp_A_size = size;
+        }
+        return temp_A;
     }
 };
 
@@ -160,24 +189,45 @@ int get_num_slices() {
     return num_slices;
 }
 
-__global__ void scale_and_add_kernel(double* C, const double* temp, double alpha, double beta, size_t size) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        C[idx] = beta * C[idx] + alpha * temp[idx];
+__global__ void fused_scale_add_kernel(
+    double* __restrict__ C, int ldc,
+    const double* __restrict__ temp, int ld_temp,
+    double alpha, double beta,
+    int M, int N
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (i < M && j < N) {
+        size_t idx_C = (size_t)j * ldc + i;
+        size_t idx_temp = (size_t)j * ld_temp + i;
+        C[idx_C] = beta * C[idx_C] + alpha * temp[idx_temp];
     }
 }
 
-__global__ void scale_kernel(double* C, double beta, size_t size) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        C[idx] = beta * C[idx];
+__global__ void copy_matrix_kernel(
+    double* __restrict__ dst, int ld_dst,
+    const double* __restrict__ src, int ld_src,
+    int rows, int cols
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (i < rows && j < cols) {
+        dst[(size_t)j * ld_dst + i] = src[(size_t)j * ld_src + i];
     }
 }
 
-__global__ void add_scaled_kernel(double* C, const double* temp, double alpha, size_t size) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        C[idx] += alpha * temp[idx];
+__global__ void transpose_matrix_kernel(
+    double* __restrict__ dst,
+    const double* __restrict__ src, int ld_src,
+    int rows, int cols
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (i < rows && j < cols) {
+        dst[(size_t)i * rows + j] = src[(size_t)j * ld_src + i];
     }
 }
 
@@ -201,9 +251,8 @@ extern "C" hipblasStatus_t hpl_ozaki_dgemm(
                               alpha, A, lda, B, ldb, beta, C, ldc);
     }
     
-    double h_alpha, h_beta;
-    hipMemcpy(&h_alpha, alpha, sizeof(double), hipMemcpyDeviceToHost);
-    hipMemcpy(&h_beta, beta, sizeof(double), hipMemcpyDeviceToHost);
+    double h_alpha = *alpha;
+    double h_beta = *beta;
     
     hipStream_t stream;
     hipblasGetStream(hipHandle, &stream);
@@ -211,54 +260,149 @@ extern "C" hipblasStatus_t hpl_ozaki_dgemm(
     bool transA = (transa != HIPBLAS_OP_N);
     bool transB = (transb != HIPBLAS_OP_N);
     
+    // For now, only handle OP_N for A (most common in HPL)
+    if (transA) {
+        return call_real_dgemm(hipHandle, transa, transb, m, n, k,
+                              alpha, A, lda, B, ldb, beta, C, ldc);
+    }
+    
     size_t M = static_cast<size_t>(m);
     size_t N = static_cast<size_t>(n);
     size_t K = static_cast<size_t>(k);
     
     OzakiContext* ctx = get_context();
     
-    size_t buffer_size = M * N * sizeof(double);
-    double* temp = ctx->get_temp_buffer(buffer_size);
-    if (!temp) {
-        static bool logged = false;
-        if (!logged) {
-            fprintf(stderr, "[OZAKI] Temp buffer allocation failed, falling back to native DGEMM\n");
-            logged = true;
-        }
-        return call_real_dgemm(hipHandle, transa, transb, m, n, k,
-                              alpha, A, lda, B, ldb, beta, C, ldc);
-    }
-    
     static int ozaki_call_count = 0;
     ozaki_call_count++;
-    if (ozaki_call_count <= 3) {
-        fprintf(stderr, "[OZAKI ACTIVE] Call #%d: m=%d, n=%d, k=%d, slices=%d, transA=%d, transB=%d, alpha=%.2f, beta=%.2f\n", 
-                ozaki_call_count, m, n, k, num_slices, transA, transB, h_alpha, h_beta);
+    if (ozaki_call_count <= 5) {
+        fprintf(stderr, "[OZAKI] Call #%d: m=%d, n=%d, k=%d, slices=%d, transA=%d, transB=%d, alpha=%.2f, beta=%.2f, lda=%d, ldb=%d, ldc=%d\n", 
+                ozaki_call_count, m, n, k, num_slices, transA, transB, h_alpha, h_beta, lda, ldb, ldc);
     }
     
     try {
+        hipGetLastError();
+        
+        // Allocate temp buffer for ozablas output (contiguous M x N)
+        size_t temp_C_bytes = M * N * sizeof(double);
+        double* temp_C = ctx->get_temp_C(temp_C_bytes);
+        if (!temp_C) {
+            return call_real_dgemm(hipHandle, transa, transb, m, n, k,
+                                  alpha, A, lda, B, ldb, beta, C, ldc);
+        }
+        
+        const double* A_ozaki = A;
+        const double* B_ozaki = B;
+        
+        // Handle A: if lda != M, need to copy to contiguous buffer
+        double* temp_A = nullptr;
+        if (lda != (int)M) {
+            size_t temp_A_bytes = M * K * sizeof(double);
+            temp_A = ctx->get_temp_A(temp_A_bytes);
+            if (!temp_A) {
+                return call_real_dgemm(hipHandle, transa, transb, m, n, k,
+                                      alpha, A, lda, B, ldb, beta, C, ldc);
+            }
+            
+            dim3 block(16, 16);
+            dim3 grid((M + 15) / 16, (K + 15) / 16);
+            hipLaunchKernelGGL(copy_matrix_kernel, grid, block, 0, stream,
+                               temp_A, M, A, lda, M, K);
+            A_ozaki = temp_A;
+        }
+        
+        // Handle B based on transpose
+        double* temp_B = nullptr;
+        size_t B_rows_ozaki, B_cols_ozaki;
+        
+        if (transB) {
+            // B is N x K (column-major), we need B^T which is K x N
+            // ozablas needs K x N contiguous column-major
+            B_rows_ozaki = K;
+            B_cols_ozaki = N;
+            
+            size_t temp_B_bytes = K * N * sizeof(double);
+            temp_B = ctx->get_temp_B(temp_B_bytes);
+            if (!temp_B) {
+                return call_real_dgemm(hipHandle, transa, transb, m, n, k,
+                                      alpha, A, lda, B, ldb, beta, C, ldc);
+            }
+            
+            // Transpose B (N x K with ldb) -> temp_B (K x N contiguous)
+            // Use rocblas_dgeam for efficient transpose
+            const double one = 1.0;
+            const double zero = 0.0;
+            rocblas_set_stream(get_global_rocblas_handle(), stream);
+            rocblas_status st = rocblas_dgeam(
+                get_global_rocblas_handle(),
+                rocblas_operation_transpose,
+                rocblas_operation_none,
+                K, N,
+                &one, B, ldb,
+                &zero, B, ldb,
+                temp_B, K
+            );
+            if (st != rocblas_status_success) {
+                return call_real_dgemm(hipHandle, transa, transb, m, n, k,
+                                      alpha, A, lda, B, ldb, beta, C, ldc);
+            }
+            B_ozaki = temp_B;
+        } else {
+            // B is K x N (column-major), use directly if contiguous
+            B_rows_ozaki = K;
+            B_cols_ozaki = N;
+            
+            if (ldb != (int)K) {
+                size_t temp_B_bytes = K * N * sizeof(double);
+                temp_B = ctx->get_temp_B(temp_B_bytes);
+                if (!temp_B) {
+                    return call_real_dgemm(hipHandle, transa, transb, m, n, k,
+                                          alpha, A, lda, B, ldb, beta, C, ldc);
+                }
+                
+                dim3 block(16, 16);
+                dim3 grid((K + 15) / 16, (N + 15) / 16);
+                hipLaunchKernelGGL(copy_matrix_kernel, grid, block, 0, stream,
+                                   temp_B, K, B, ldb, K, N);
+                B_ozaki = temp_B;
+            }
+        }
+        
+        hipStreamSynchronize(stream);
+        
+        // Get workspace and compute
         ozablas::WorkspaceScheme1* ws = ctx->get_workspace(M, N, K, num_slices);
         
-        hipMemset(temp, 0, buffer_size);
+        hipMemsetAsync(temp_C, 0, temp_C_bytes, stream);
+        hipStreamSynchronize(stream);
         
-        ozablas::ozaki_scheme1_gemm(*ws, A, B, temp);
+        // ozablas computes: temp_C = A_ozaki * B_ozaki
+        // A_ozaki is M x K, B_ozaki is K x N, temp_C is M x N (all contiguous column-major)
+        ozablas::ozaki_scheme1_gemm(*ws, A_ozaki, B_ozaki, temp_C);
         
         ctx->executor->synchronize();
         
-        size_t total_elements = M * N;
-        int block_size = 256;
-        int num_blocks = (total_elements + block_size - 1) / block_size;
+        hipError_t ozaki_err = hipGetLastError();
+        if (ozaki_err != hipSuccess) {
+            fprintf(stderr, "[OZAKI] HIP error after gemm: %s\n", hipGetErrorString(ozaki_err));
+            return call_real_dgemm(hipHandle, transa, transb, m, n, k,
+                                  alpha, A, lda, B, ldb, beta, C, ldc);
+        }
         
-        if (h_beta == 0.0) {
-            hipLaunchKernelGGL(add_scaled_kernel, dim3(num_blocks), dim3(block_size), 0, stream,
-                               C, temp, h_alpha, total_elements);
-        } else {
-            hipLaunchKernelGGL(scale_and_add_kernel, dim3(num_blocks), dim3(block_size), 0, stream,
-                               C, temp, h_alpha, h_beta, total_elements);
+        // Apply alpha/beta: C = beta * C + alpha * temp_C
+        // Handle non-contiguous C (ldc != M)
+        dim3 block(16, 16);
+        dim3 grid((M + 15) / 16, (N + 15) / 16);
+        hipLaunchKernelGGL(fused_scale_add_kernel, grid, block, 0, stream,
+                           C, ldc, temp_C, M, h_alpha, h_beta, M, N);
+        
+        hipError_t kernel_err = hipGetLastError();
+        if (kernel_err != hipSuccess) {
+            fprintf(stderr, "[OZAKI] HIP error in scale kernel: %s\n", hipGetErrorString(kernel_err));
+            return HIPBLAS_STATUS_EXECUTION_FAILED;
         }
         
     } catch (const std::exception& e) {
-        fprintf(stderr, "[OZAKI] Exception: %s, falling back to native DGEMM\n", e.what());
+        fprintf(stderr, "[OZAKI] Exception: %s\n", e.what());
         return call_real_dgemm(hipHandle, transa, transb, m, n, k,
                               alpha, A, lda, B, ldb, beta, C, ldc);
     }
